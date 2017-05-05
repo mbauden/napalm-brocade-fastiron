@@ -12,5 +12,5 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-"""napalm-skeleton package."""
-from skeleton import SkeletonDriver
+"""napalm-fastiron package."""
+from brocade_fastiron import BrocadeFastironDriver
