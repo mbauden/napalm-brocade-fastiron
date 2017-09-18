@@ -163,40 +163,33 @@ class BrocadeFastironDriver(NetworkDriver):
     def commit_config(self):
         pass
 
-    def get_arp_table(self):
+    def get_mac_address_table(self):
 
-        arp_table = list()
+        cmd = "show mac-address"
+        lines = self.device.send_command(cmd)
+        lines = lines.split('\n')
 
-        arp_cmd = 'show arp'
-        output = self.device.send_command(arp_cmd)
-        output = output.split('\n')
-        output = output[3:]
+        mac_address_table = []
+        lines = lines[2:]
 
-        for line in output:
+        for line in lines:
             fields = line.split()
-            if len(fields) == 7:
-                num, address, mac, typ, age, interface, status = fields
-                try:
-                    if age == 'None':
-                        age = 0
-                    age = float(age)
-                except ValueError:
-                    print(
-                        "Unable to convert age value to float: {}".format(age)
-                        )
 
-                if "None" in mac:
-                    mac = "00:00:00:00:00:00"
-                else:
-                    mac = napalm_base.helpers.mac(mac)
+            if len(fields) == 4:
+                mac_address, port, typ, vlan = fields
+            
+                is_static = not bool('Dynamic' in typ)
+                mac_address = napalm_base.helpers.mac(mac_address)
 
-                if status == 'Valid':
-                    entry = {
-                        'interface': interface,
-                        'mac': mac,
-                        'ip': address,
-                        'age': age
-                    }
-                    arp_table.append(entry)
-
-        return arp_table
+                entry = {
+                   'mac': mac_address,
+                   'interface': unicode(port),
+                   'vlan': int(vlan),
+                   'active': bool(1),
+                   'static': is_static,
+                   'moves': -1,
+                   'last_move': float(-1)
+                }
+                mac_address_table.append(entry)
+            
+        return mac_address_table
