@@ -19,6 +19,7 @@ Napalm driver for Brocade Fastiron.
 from netmiko import ConnectHandler
 from netmiko import __version__ as netmiko_version
 from napalm_base.base import NetworkDriver
+import napalm_base.helpers
 from napalm_base.exceptions import (
     ConnectionException,
     SessionLockedException,
@@ -161,3 +162,41 @@ class BrocadeFastironDriver(NetworkDriver):
 
     def commit_config(self):
         pass
+
+    def get_arp_table(self):
+
+        arp_table = list()
+
+        arp_cmd = 'show arp'
+        output = self.device.send_command(arp_cmd)
+        output = output.split('\n')
+        output = output[3:]
+
+        for line in output:
+            fields = line.split()
+            if len(fields) == 7:
+                num, address, mac, typ, age, interface, status = fields
+                try:
+                    if age == 'None':
+                        age = 0
+                    age = float(age)
+                except ValueError:
+                    print(
+                        "Unable to convert age value to float: {}".format(age)
+                        )
+
+                if "None" in mac:
+                    mac = "00:00:00:00:00:00"
+                else:
+                    mac = napalm_base.helpers.mac(mac)
+
+                if status == 'Valid':
+                    entry = {
+                        'interface': interface,
+                        'mac': mac,
+                        'ip': address,
+                        'age': age
+                    }
+                    arp_table.append(entry)
+
+        return arp_table
