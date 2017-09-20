@@ -26,24 +26,26 @@ from napalm_base.exceptions import (
     ReplaceConfigException,
     CommandErrorException,
     )
-
+import napalm_base.helpers
+from netaddr import IPNetwork
 import re
-import uuid
-import tempfile
 
 
 class BrocadeFastironDriver(NetworkDriver):
     """Napalm driver for Brocade Fastiron."""
 
-    def __init__(self, hostname, username, password, timeout=60, optional_args=None):
+    def __init__(self, hostname, username, password, timeout=60,
+                 optional_args=None):
         if optional_args is None:
             optional_args = {}
-        self.device = None
         self.hostname = hostname
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.os_version = None
+
+        self.device = None
+        self._os_version = None
+        self._merge_cfg = None
 
         # Netmiko possible arguments
         netmiko_argument_map = {
@@ -87,22 +89,21 @@ class BrocadeFastironDriver(NetworkDriver):
                                      password=self.password,
                                      **self.netmiko_optional_args)
         self.device.enable()
-        self._set_os_version()
-        print type(self.device)
+        self._get_os_version()
 
     def close(self):
         """Implementation of NAPALM method close."""
 
         self.device.disconnect()
 
-    def _set_os_version(self):
+    def _get_os_version(self):
         """
-        Sets the local os_version variable since some commands and output
+        Sets the local os_version variable because some commands and output
         differ between version 7 and 8
         """
         cmd = 'show version | include SW: Version'
         output = self._send_command(cmd)
-        self.os_version = int(output.splitlines()[0].split()[2].split('.')[0])
+        self._os_version = int(output.splitlines()[0].split()[2].split('.')[0])
 
     def _send_command(self, command):
         """
@@ -116,7 +117,10 @@ class BrocadeFastironDriver(NetworkDriver):
                     break
         else:
             output = self.device.send_command(command)
-        return output.strip()
+        return output
+
+    def _write_memory(self):
+        pass
 
     def is_alive(self):
         """Returns a flag with the state of the SSH connection."""
@@ -154,10 +158,324 @@ class BrocadeFastironDriver(NetworkDriver):
         if retrieve.lower() in ('startup', 'all'):
             command = 'show configuration'
             configs['startup'] = self._send_command(command)
-        return config
+        return configs
 
     def load_merge_candidate(self, filename=None, config=None):
-        pass
+        if filename and config:
+            raise ValueError("Cannot simultaneously set filename and config")
+
+        if filename:
+            with open(filename, 'r') as fobj:
+                self._merge_cfg = filter(None, (l.strip() for l in fobj))
+
+        if config:
+            if isinstance(config, list):
+                self._merge_cfg = filter(None, (l.strip() for l in config))
+            else:
+                self._merge_cfg = filter(None,
+                                       (l.strip() for l in config.splitlines()))
 
     def commit_config(self):
+        output = self.device.send_config_set(self._merge_cfg)
+        self._send_command('write memory')
+        return output
+
+    def get_arp_table(self):
+        """Get arp table information."""
+        arp_table = list()
+        cmd = 'show arp'
+        output = self._send_command(cmd).splitlines()
+
+        # Skip over the heacder
+        if self._os_version == 7:
+            output = output[2:]
+        if self._os_version == 8:
+            output = output[3:]
+
+        for line in output:
+            fields = line.split()
+            if len(fields) == 7:
+                num, address, mac, typ, age, interface, state = fields
+
+                try:
+                    age = float(age)
+                except ValueError:
+                    raise ValueError("Unable to convert age value to float: {}".format(age))
+
+                if 'None' in mac:
+                    mac = napalm_base.helpers.mac("00:00:00:00:00:00")
+                else:
+                    mac = napalm_base.helpers.mac(mac)
+
+                entry = {
+                    'interface': interface,
+                    'mac': mac,
+                    'ip': address,
+                    'age': age
+                }
+
+                arp_table.append(entry)
+
+        return arp_table
+
+    def _parse_port_change(self, string):
+        # 632 days 18 hours 20 minutes 40 seconds
+        # 3 days 36 minutes 18 seconds
+        # 1 seconds
+        days, hours, mins, secs = [0,0,0,0]
+        re_d = re.search('(\d+) days', string)
+        re_h = re.search('(\d+) hours', string)
+        re_m = re.search('(\d+) minutes', string)
+        re_s = re.search('(\d+) seconds', string)
+
+        if re_d:
+            days = int(re_d.group(1))
+        if re_h:
+            hours = int(re_h.group(1))
+        if re_m:
+            mins = int(re_m.group(1))
+        if re_s:
+            secs = int(re_s.group(1))
+
+        t = secs + (mins*60) + (hours*60*60) + (days*24*60*60)
+        if t == 0:
+            return -1
+        return t
+
+    def _calc_speed(self, speed):
+        unit = speed[-4]
+        if unit == 'M':
+            s = int(speed[:-4])
+        else:
+            s = int(speed[:-4]) * 1000
+        return s
+
+    def _get_interface_details(self, port):
+        re_mgmt = re.match('mgmt(\d+)', port)
+        if re_mgmt:
+            cmd = 'show interface management {}'.format(re_mgmt.group(1))
+        else:
+            cmd = 'show interface ethernet {}'.format(port)
+        output = self._send_command(cmd)
+
+        last_flap = -1
+        description = ''
+        speed = 1000
+
+        if self._os_version == 8:
+            last_flap = re.search(r'Port \S+ for (\d.*seconds)', output).group(1)
+            last_flap = self._parse_port_change(last_flap)
+
+        re_desc = re.search(r'\sPort name is (.*)', output, re.MULTILINE)
+        if re_desc:
+            description = re_desc.group(1)
+
+        re_speed = re.search('\sConfigured speed (\S+), actual (\S+),', output)
+        if 'unknown' not in re_speed.group(2):
+            speed = self._calc_speed(re_speed.group(2))
+        elif 'auto' not in re_speed.group(1):
+            speed = self._calc_speed(re_speed.group(1))
+
+        return [last_flap, description, speed]
+
+    def _get_logical_interface_detail(self, port):
+        port = port.replace('lb', 'loopback')
+        cmd = 'show interface {}'.format(port)
+        output = self._send_command(cmd)
+
+        speed = -1
+        last_flap = -1
+        description = ''
+
+        re_desc = re.search(r'\sPort name is (.*)', output, re.MULTILINE)
+        if re_desc:
+            description = re_desc.group(1)
+
+        return [last_flap, description, speed]
+
+    def get_interfaces(self):
+        """Get interface details."""
+        interface_list = dict()
+
+        cmd = 'sh interfaces brief'
+        output = self._send_command(cmd).splitlines()
+
+        for line in output:
+            fields = line.split()
+
+            if len(fields) == 0:
+                continue
+            if fields[0] == 'Port':
+                continue
+
+            port, link, state = fields[:3]
+            speed = fields[4]
+            mac = fields[9]
+
+            if 'N/A' not in mac:
+                mac = napalm_base.helpers.mac(mac)
+
+            if re.match('(\d+/\d+)', port):
+                is_up = bool('forward' in state.lower())
+                is_enabled = not bool('disable' in link.lower())
+                port_details = self._get_interface_details(port)
+            elif re.match('(ve|lb|mgmt)\d+', port):
+                is_enabled = not bool('down' in link.lower())
+                is_up = is_enabled
+                if 'mgmt' in port:
+                    port_details = self._get_interface_details(port)
+                else:
+                    port_details = self._get_logical_interface_detail(port)
+            else:
+                continue
+
+            interface_list[port] = {
+                'is_up': is_up,
+                'is_enabled': is_enabled,
+                'description': unicode(port_details[1]),
+                'last_flapped': float(port_details[0]),
+                'speed': port_details[2],
+                'mac_address': mac
+            }
+
+        return interface_list
+
+    def _get_detailed_counters(self, port):
+        counters = dict()
+        re_mgmt = re.match('mgmt(\d+)', port)
+        if re_mgmt:
+            cmd = 'show statistics management {}'.format(re_mgmt.group(1))
+        else:
+            cmd = 'show statistics ethernet {}'.format(port)
+
+        output = self._send_command(cmd)
+
+        octets = re.search(r'InOctets\s+(\d+)\s+OutOctets\s+(\d+)', output)
+        if octets:
+            counters['rx_octets'] = octets.group(1)
+            counters['tx_octets'] = octets.group(2)
+
+        packets = re.search(r'InUnicastPkts\s+(\d+)\s+OutUnicastPkts\s+(\d+)',
+                            output)
+        if packets:
+            counters['rx_unicast_packets'] = packets.group(1)
+            counters['rx_unicast_packets'] = packets.group(2)
+
+        multicast = re.search(r'InMulticastPkts\s+(\d+)\s+OutMulticastPkts\s+(\d+)',
+                              output)
+        if multicast:
+            counters['rx_multicast_packets'] = multicast.group(1)
+            counters['tx_multicast_packets'] = multicast.group(2)
+
+        broadcast = re.search(r'InBroadcastPkts\s+(\d+)\s+OutBroadcastPkts\s+(\d+)',
+                              output)
+        if broadcast:
+            counters['rx_broadcast_packets'] = broadcast.group(1)
+            counters['tx_broadcast_packets'] = broadcast.group(2)
+
+        discards = re.search(r'InDiscards\s+(\d+)', output)
+        if discards:
+            counters['rx_discards'] = discards.group(1)
+
+        out_errors = re.search(r'OutErrors\s+(\d+)', output)
+        if out_errors:
+            counters['tx_errors'] = out_errors.group(1)
+
+        in_errors = re.search(r'InErrors\s+(\d+)', output)
+        if in_errors:
+            counters['rx_errors'] = in_errors.group(1)
+
+        return counters
+
+    def get_interfaces_counters(self):
+        counters = dict()
+        cmd = 'show statistics'
+        output = self._send_command(cmd).splitlines()
+        output = output[2:-1]
+
+        ports = list()
+        for line in output:
+            fields = line.split()
+            ports.append(fields[0])
+
+        for port in ports:
+            counters[port] = self._get_detailed_counters(port)
+
+        return counters
+
+    def get_mac_address_table(self):
+        mac_address_table = list()
+        cmd = 'show mac-address'
+        output = self._send_command(cmd).splitlines()
+        output = output[2:]
+
+        for line in output:
+            fields = line.split()
+            if len(fields) == 5 and 'MAC-Address' not in fields[0]:
+                mac, port, mtype, index, vlan = fields
+                is_static = not bool('Dynamic' in mtype)
+                mac = napalm_base.helpers.mac(mac)
+
+                entry = {
+                    'mac': mac,
+                    'interface': unicode(port),
+                    'vlan': int(vlan),
+                    'active': True,
+                    'static': is_static,
+                    'moves': -1,
+                    'last_move': float(-1)
+                }
+
+                mac_address_table.append(entry)
+
+        return mac_address_table
+
+    def get_interfaces_ip(self):
+        interfaces = dict()
+        config = self.get_config(retrieve='running')['running'].splitlines()
+
+        for line in config:
+            re_int = re.match('interface\s(\S+)\s(\S+)', line)
+            if re_int:
+                if_block = True
+                port = "{}{}".format(re_int.group(1),re_int.group(2))
+                port = port.replace('ethernet', '')
+                port = port.replace('loopback', 'lb')
+                port = port.replace('management', 'mgmt')
+                port = port.replace('ve', 'v')
+                continue
+
+            re_ip = re.search('^\s(ip|ipv6) address (.*)', line)
+            if re_ip:
+                ip = re_ip.group(2)
+                ip = ip.replace(' dynamic', '')
+                ip = ip.replace(' ', '/')
+                ip = IPNetwork(ip)
+                ver = "ipv{}".format(ip.version)
+
+                if port not in interfaces:
+                    interfaces[port] = dict()
+                if ver not in interfaces[port]:
+                    interfaces[port][ver] = dict()
+
+                interfaces[port][ver][str(ip.ip)] = {'prefix_length': ip.prefixlen}
+
+        return interfaces
+
+    def get_lldp_neighbors(self):
+        pass
+
+    def get_lldp_neighbors_detail(self, interface=''):
+        pass
+
+    def get_environment(self):
+        pass
+
+    def get_ntp_servers(self):
+        pass
+
+    def get_ntp_stats(self):
+        pass
+
+    def get_route_to(self, destination='', protocol=''):
         pass
