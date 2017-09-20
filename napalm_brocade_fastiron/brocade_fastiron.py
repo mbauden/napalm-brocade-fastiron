@@ -19,6 +19,7 @@ Napalm driver for Brocade Fastiron.
 from netmiko import ConnectHandler
 from netmiko import __version__ as netmiko_version
 from napalm_base.base import NetworkDriver
+import napalm_base.helpers
 from napalm_base.exceptions import (
     ConnectionException,
     SessionLockedException,
@@ -479,3 +480,34 @@ class BrocadeFastironDriver(NetworkDriver):
 
     def get_route_to(self, destination='', protocol=''):
         pass
+
+    def get_mac_address_table(self):
+
+        cmd = "show mac-address"
+        lines = self.device.send_command(cmd)
+        lines = lines.split('\n')
+
+        mac_address_table = []
+        lines = lines[2:]
+
+        for line in lines:
+            fields = line.split()
+
+            if len(fields) == 4:
+                mac_address, port, typ, vlan = fields
+            
+                is_static = not bool('Dynamic' in typ)
+                mac_address = napalm_base.helpers.mac(mac_address)
+
+                entry = {
+                   'mac': mac_address,
+                   'interface': unicode(port),
+                   'vlan': int(vlan),
+                   'active': bool(1),
+                   'static': is_static,
+                   'moves': -1,
+                   'last_move': float(-1)
+                }
+                mac_address_table.append(entry)
+            
+        return mac_address_table
